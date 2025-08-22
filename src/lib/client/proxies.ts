@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { derived, get, writable, type Readable, type Updater, type Writable } from 'svelte/store';
+import type { Readable, Updater, Writable } from 'svelte/store';
 import type { InputConstraint } from '../jsonSchema/constraints.js';
 import { SuperFormError } from '$lib/errors.js';
 import { pathExists, traversePath } from '../traversal.js';
@@ -58,6 +58,98 @@ const defaultOptions = {
 	dateFormat: 'iso',
 	step: 60
 } satisfies DefaultOptions;
+
+///// Rune-friendly store implementations ///////////////////////////
+
+/**
+ * Creates a rune-friendly writable store
+ */
+function createWritable<T>(value: T): Writable<T> {
+	const subscribers = new Set<(value: T) => void>();
+	let currentValue = value;
+
+	return {
+		subscribe(run: (value: T) => void) {
+			run(currentValue);
+			subscribers.add(run);
+			return () => {
+				subscribers.delete(run);
+			};
+		},
+		set(newValue: T) {
+			if (currentValue !== newValue) {
+				currentValue = newValue;
+				subscribers.forEach((run) => run(currentValue));
+			}
+		},
+		update(updater: Updater<T>) {
+			const newValue = updater(currentValue);
+			if (currentValue !== newValue) {
+				currentValue = newValue;
+				subscribers.forEach((run) => run(currentValue));
+			}
+		}
+	};
+}
+
+/**
+ * Creates a rune-friendly derived store
+ */
+function createDerived<T, U>(
+	store: Readable<T>,
+	fn: (value: T) => U,
+	initialValue?: U
+): Readable<U> {
+	const subscribers = new Set<(value: U) => void>();
+	let currentValue = initialValue as U;
+	let initialized = false;
+	let unsubscribe: (() => void) | null = null;
+
+	function startListening() {
+		if (unsubscribe) return;
+
+		unsubscribe = store.subscribe((value) => {
+			const newValue = fn(value);
+			if (!initialized || currentValue !== newValue) {
+				currentValue = newValue;
+				initialized = true;
+				subscribers.forEach((run) => run(currentValue));
+			}
+		});
+	}
+
+	return {
+		subscribe(run: (value: U) => void) {
+			if (subscribers.size === 0) {
+				startListening();
+			}
+
+			subscribers.add(run);
+			if (initialized) {
+				run(currentValue);
+			}
+
+			return () => {
+				subscribers.delete(run);
+				if (subscribers.size === 0 && unsubscribe) {
+					unsubscribe();
+					unsubscribe = null;
+				}
+			};
+		}
+	};
+}
+
+/**
+ * Gets the current value from a store synchronously
+ */
+function getValue<T>(store: Readable<T>): T {
+	let value: T;
+	store.subscribe((v) => {
+		value = v;
+	})();
+	return value!;
+}
 
 ///// Proxy functions ///////////////////////////////////////////////
 
@@ -146,7 +238,7 @@ export function fileProxy<T extends Record<string, unknown>, Path extends FormPa
 	options?: ProxyOptions & { empty?: 'null' | 'undefined' }
 ) {
 	const formFile = fieldProxy(form, path, options) as FieldProxy<File>;
-	const fileProxy = writable<FileList>(browser ? new DataTransfer().files : ({} as FileList));
+	const fileProxy = createWritable<FileList>(browser ? new DataTransfer().files : ({} as FileList));
 
 	let initialized = false;
 	let initialValue: File | null | undefined;
@@ -211,7 +303,9 @@ export function filesProxy<
 	const formFiles = fieldProxy(form, path as any, options) as FieldProxy<
 		File[] | Nullable<T, Path> | Optional<T, Path>
 	>;
-	const filesProxy = writable<FileList>(browser ? new DataTransfer().files : ({} as FileList));
+	const filesProxy = createWritable<FileList>(
+		browser ? new DataTransfer().files : ({} as FileList)
+	);
 
 	formFiles.subscribe((files) => {
 		if (!browser) return;
@@ -254,7 +348,7 @@ export function filesProxy<
 			}
 		},
 		update(updater: Updater<File[] | Nullable<T, Path> | Optional<T, Path>>) {
-			filesStore.set(updater(get(formFiles)));
+			filesStore.set(updater(getValue(formFiles)));
 		}
 	};
 
@@ -323,7 +417,7 @@ function _stringProxy<T extends Record<string, unknown>, Path extends FormPaths<
 	let updatedValue: string | null = null;
 	let initialized = false;
 
-	const proxy: Readable<string> = derived(realProxy, (value: unknown) => {
+	const proxy: Readable<string> = createDerived(realProxy, (value: unknown) => {
 		if (!initialized) {
 			initialized = true;
 			if (options.initiallyEmptyIfZero && !value) return '';
@@ -420,7 +514,7 @@ export function arrayProxy<
 ): ArrayProxy<FormPathType<T, Path> extends (infer U)[] ? U : never, Path> {
 	const formErrors = fieldProxy(superForm.errors, `${path}` as any);
 
-	const onlyFieldErrors = derived<typeof formErrors, ValueErrors>(formErrors, ($errors) => {
+	const onlyFieldErrors = createDerived(formErrors, ($errors) => {
 		const output: ValueErrors = [];
 		for (const key in $errors) {
 			if (key == '_errors') continue;
@@ -460,7 +554,7 @@ export function arrayProxy<
 
 	// If array is shortened, delete all keys above length
 	// in errors, so they won't be kept if the array is lengthened again.
-	let lastLength = Array.isArray(get(values)) ? (get(values) as unknown[]).length : 0;
+	let lastLength = Array.isArray(getValue(values)) ? (getValue(values) as unknown[]).length : 0;
 	values.subscribe(($values) => {
 		const currentLength = Array.isArray($values) ? $values.length : 0;
 		if (currentLength < lastLength) {
@@ -511,14 +605,11 @@ export function formFieldProxy<
 	// Filter out array indices, the constraints structure doesn't contain these.
 	const constraintsPath = path2.filter((p) => /\D/.test(String(p))).join('.');
 
-	const taintedProxy = derived<typeof superForm.tainted, boolean | undefined>(
-		superForm.tainted,
-		($tainted) => {
-			if (!$tainted) return $tainted;
-			const taintedPath = traversePath($tainted, path2);
-			return taintedPath ? taintedPath.value : undefined;
-		}
-	);
+	const taintedProxy = createDerived(superForm.tainted, ($tainted) => {
+		if (!$tainted) return $tainted;
+		const taintedPath = traversePath($tainted, path2);
+		return taintedPath ? taintedPath.value : undefined;
+	});
 
 	const tainted = {
 		subscribe: taintedProxy.subscribe,
@@ -587,7 +678,7 @@ function superFieldProxy<T extends Record<string, unknown>, Path extends string,
 	const form = superForm.form;
 	const path2 = splitPath(path);
 
-	const proxy = derived(form, ($form: object) => {
+	const proxy = createDerived(form, ($form: object) => {
 		const data = traversePath($form, path2);
 		return data?.value;
 	});
@@ -638,7 +729,7 @@ export function fieldProxy<
 		return superFieldProxy(form, path, options);
 	}
 
-	const proxy = derived(form, ($form) => {
+	const proxy = createDerived(form, ($form) => {
 		const data = traversePath($form, path2);
 		return data?.value;
 	});
